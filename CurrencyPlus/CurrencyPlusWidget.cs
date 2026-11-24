@@ -1,5 +1,3 @@
-using Dalamud.Bindings.ImGui;
-
 namespace Umbra.CurrencyPlus;
 
 /// <summary>
@@ -11,116 +9,109 @@ internal sealed class LocalizedToolbarWidgetAttribute() : ToolbarWidgetAttribute
     "CurrencyPlus",
     Strings.T("WidgetName"),
     Strings.T("WidgetDesc"),
-    ["currency", "currencies", "monnaie", "monnaies", "tomestone", "mémoquartz", "scrip", "assignat", "seal", "sceau", "universalis", "spend", "collection"]
+    ["currency", "currencies", "monnaie", "monnaies", "devises", "tomestone", "mémoquartz", "scrip", "assignat", "seal", "sceau", "universalis", "spend", "collection"]
 );
 
+/// <summary>
+/// Une icône dans la barre. Au clic, la popup montre les monnaies suivies et ce qu'on peut en faire.
+/// L'icône prend la couleur d'alerte quand une monnaie suivie approche de son plafond.
+/// </summary>
 [LocalizedToolbarWidget]
 public sealed class CurrencyPlusWidget(
     WidgetInfo                  info,
     string?                     guid         = null,
     Dictionary<string, object>? configValues = null
-) : ToolbarWidget(info, guid, configValues)
+) : StandardToolbarWidget(info, guid, configValues)
 {
+    /// <summary>Colonnes facultatives de l'onglet « Rentable » (identifiants internes).</summary>
+    public static readonly string[] ProfitColumns = ["Cost", "Price", "Sales", "GilPerPoint", "Score"];
+
+    protected override StandardWidgetFeatures Features =>
+        StandardWidgetFeatures.Icon |
+        StandardWidgetFeatures.CustomizableIcon;
+
+    protected override string          DefaultIconType        => IconTypeFontAwesome;
+    protected override FontAwesomeIcon DefaultFontAwesomeIcon => FontAwesomeIcon.Coins;
+
     private CurrencyPlusPopup? _popup;
 
     public override WidgetPopup? Popup => _popup ??= new CurrencyPlusPopup(this);
 
-    public override Node Node { get; } = new() {
-        ClassList  = ["cp-bar"],
-        Stylesheet = BarStylesheet,
-        ChildNodes = [
-            new() { ClassList = ["cp-empty"] },
-        ],
-    };
+    private List<CurrencyState> _states   = [];
+    private DateTime            _nextRead = DateTime.MinValue;
 
-    private readonly Dictionary<uint, Node> _itemNodes = [];
-    private          List<CurrencyState>    _states    = [];
-    private          string                 _signature = string.Empty;
-    private          DateTime               _nextRead  = DateTime.MinValue;
-
-    /// <summary>Monnaies suivies, dans l'ordre de la config, lues au dernier rafraîchissement.</summary>
+    /// <summary>Monnaies suivies, dans l'ordre choisi, lues au dernier rafraîchissement.</summary>
     public IReadOnlyList<CurrencyState> States => _states;
 
     // ------------------------------------------------------------------ Config
 
     protected override IEnumerable<IWidgetConfigVariable> GetConfigVariables()
     {
-        string cat = Strings.T("WidgetName");
+        string cat     = Strings.T("WidgetName");
+        string colsCat = Strings.T("Cfg.Columns");
 
         return [
-            new BooleanWidgetConfigVariable("Decorate", Strings.T("Cfg.Decorate"), Strings.T("Cfg.Decorate.Desc"), true) { Category = cat },
-            new BooleanWidgetConfigVariable("ShowCap", Strings.T("Cfg.ShowCap"), Strings.T("Cfg.ShowCap.Desc"), false) { Category = cat },
+            ..base.GetConfigVariables(),
+
+            // Liste des monnaies suivies, modifiée depuis la popup (bouton « Gérer »), où elles s'affichent avec leur icône.
+            new StringWidgetConfigVariable("TrackedIds", Strings.T("Cfg.TrackedIds"), Strings.T("Cfg.TrackedIds.Desc"), Currencies.DefaultTracked, 1024) {
+                Category = cat,
+                IsHidden = true,
+            },
             new IntegerWidgetConfigVariable("AlertThreshold", Strings.T("Cfg.Threshold"), Strings.T("Cfg.Threshold.Desc"), 90, 1, 100) { Category = cat },
             new ColorWidgetConfigVariable("AlertColor", Strings.T("Cfg.AlertColor"), null, 0xFF40A0FF) { Category = cat },
+            new BooleanWidgetConfigVariable("Teleport", Strings.T("Cfg.Teleport"), Strings.T("Cfg.Teleport.Desc"), true) { Category = cat },
             new SelectWidgetConfigVariable(
                 "Market", Strings.T("Cfg.Market"), Strings.T("Cfg.Market.Desc"), "World",
                 new() { ["World"] = Strings.T("Cfg.Market.World"), ["DataCenter"] = Strings.T("Cfg.Market.DC") }
             ) { Category = cat },
             new IntegerWidgetConfigVariable("CacheHours", Strings.T("Cfg.CacheHours"), Strings.T("Cfg.CacheHours.Desc"), 3, 1, 48) { Category = cat },
             new IntegerWidgetConfigVariable("MaxRows", Strings.T("Cfg.MaxRows"), null, 150, 10, 500) { Category = cat },
-            ..GetCurrencyVariables(),
+            ..ProfitColumns.Select(c => new BooleanWidgetConfigVariable($"Col_{c}", Strings.T($"Col.{c}"), Strings.T("Cfg.Column.Desc"), true) {
+                Category = colsCat,
+            }),
         ];
     }
 
-    private static IEnumerable<IWidgetConfigVariable> GetCurrencyVariables()
+    /// <summary>ID des monnaies suivies, dans l'ordre.</summary>
+    public List<uint> TrackedIds()
     {
-        string cat = Strings.T("Cfg.Currencies");
+        string raw = GetConfigValue<string>("TrackedIds").Trim();
+        if (raw == Currencies.DefaultTracked) return Currencies.DefaultIds().Where(id => id != 0).Distinct().ToList();
 
-        foreach (var def in Currencies.Defaults) {
-            yield return new BooleanWidgetConfigVariable(TrackVar(def), CurrencyLabel(def), Strings.T("Cfg.Track.Desc"), def.DefaultTracked) {
-                Category = cat,
-            };
+        List<uint> ids = [];
+        foreach (string part in raw.Split(',', ';', ' ')) {
+            if (uint.TryParse(part.Trim(), out uint id) && id != 0 && !ids.Contains(id)) ids.Add(id);
         }
 
-        yield return new StringWidgetConfigVariable("CustomIds", Strings.T("Cfg.CustomIds"), Strings.T("Cfg.CustomIds.Desc"), "", 256) {
-            Category = cat,
-        };
+        return ids;
     }
 
-    private static string TrackVar(CurrencyDef def) => $"Track_{def.Key}";
-
-    /// <summary>Libellé de la case à cocher : nom de l'objet (langue du client) ou description pour les monnaies variables.</summary>
-    private static string CurrencyLabel(CurrencyDef def)
+    /// <summary>Ajoute ou retire une monnaie (depuis le sélecteur de la popup).</summary>
+    public void ToggleTracked(uint itemId)
     {
-        string? fixedLabel = def.Key switch {
-            "GCSeals"        => Strings.T("Cfg.GCSeals"),
-            "LimitedTome"    => Strings.T("Cfg.LimitedTome"),
-            "NonLimitedTome" => Strings.T("Cfg.NonLimitedTome"),
-            _                => null,
-        };
+        var ids = TrackedIds();
+        if (!ids.Remove(itemId)) ids.Add(itemId);
 
-        string? itemName = null;
-        try {
-            uint id = def.ResolveItemId();
-            if (id != 0) itemName = Currencies.Read(id)?.Name;
-        } catch {
-            // Données indisponibles (personnage non connecté…) : on garde la clé.
-        }
-
-        if (fixedLabel != null) return itemName != null ? $"{fixedLabel} ({itemName})" : fixedLabel;
-        return itemName ?? def.Key;
+        SetConfigValue("TrackedIds", string.Join(",", ids));
+        _nextRead = DateTime.MinValue;
     }
+
+    public bool IsColumnVisible(string column) => GetConfigValue<bool>($"Col_{column}");
 
     // ------------------------------------------------------------- Lifecycle
 
-    protected override void Initialize()
+    private bool _alert;
+
+    protected override void OnLoad()
     {
-        // Enregistré avant le gestionnaire d'Umbra (ajouté dans Setup après Initialize) :
-        // on sait quelle monnaie est sous la souris quand la popup s'ouvre.
-        Node.OnMouseDown += _ => {
-            Vector2 mouse = ImGui.GetMousePos();
-            foreach (var (id, node) in _itemNodes) {
-                if (node.Bounds.MarginRect.Contains(mouse)) {
-                    (_popup ??= new CurrencyPlusPopup(this)).Select(id);
-                    break;
-                }
-            }
-        };
+        SetTooltip(Strings.T("WidgetName"));
     }
 
-    protected override void OnUpdate()
+    protected override void OnDraw()
     {
-        Node.ToggleTag("ghost", !GetConfigValue<bool>("Decorate"));
+        // Umbra réapplique la couleur d'icône du réglage à chaque image, juste avant OnDraw.
+        if (_alert) SetIconColor(AlertColor);
 
         if (DateTime.UtcNow < _nextRead) return;
         _nextRead = DateTime.UtcNow.AddMilliseconds(500);
@@ -132,27 +123,7 @@ public sealed class CurrencyPlusWidget(
             return;
         }
 
-        RebuildIfNeeded();
-        UpdateNodes();
-    }
-
-    /// <summary>ID des monnaies suivies : cases cochées puis ID personnalisés, sans doublon.</summary>
-    public List<uint> TrackedIds()
-    {
-        List<uint> ids = [];
-
-        foreach (var def in Currencies.Defaults) {
-            if (!GetConfigValue<bool>(TrackVar(def))) continue;
-
-            uint id = def.ResolveItemId();
-            if (id != 0 && !ids.Contains(id)) ids.Add(id);
-        }
-
-        foreach (string part in GetConfigValue<string>("CustomIds").Split(',', ';', ' ')) {
-            if (uint.TryParse(part.Trim(), out uint id) && id != 0 && !ids.Contains(id)) ids.Add(id);
-        }
-
-        return ids;
+        UpdateToolbar();
     }
 
     private List<CurrencyState> ReadTrackedCurrencies()
@@ -172,103 +143,26 @@ public sealed class CurrencyPlusWidget(
 
     public Color AlertColor => new(GetConfigValue<uint>("AlertColor"));
 
-    // ----------------------------------------------------------------- Display
-
-    private void RebuildIfNeeded()
+    private void UpdateToolbar()
     {
-        string signature = string.Join(",", _states.Select(s => s.ItemId));
-        if (signature == _signature) return;
-        _signature = signature;
+        _alert = _states.Any(IsAlert);
+        if (_alert) SetIconColor(AlertColor);
 
-        Node.Clear();
-        _itemNodes.Clear();
+        List<string> lines = [Strings.T("WidgetName")];
 
         if (_states.Count == 0) {
-            Node.AppendChild(new() { ClassList = ["cp-empty"], NodeValue = Strings.T("NoCurrency") });
-            return;
+            lines.Add(Strings.T("NoCurrency"));
+        } else {
+            lines.Add("");
+            foreach (var s in _states) {
+                string line = s.Cap > 0 ? $"{s.Name} : {s.Count:N0} / {s.Cap:N0}" : $"{s.Name} : {s.Count:N0}";
+                lines.Add(IsAlert(s) ? $"⚠ {line}" : line);
+            }
         }
 
-        foreach (var s in _states) {
-            var node = new Node {
-                ClassList  = ["cp-item"],
-                ChildNodes = [
-                    new() { ClassList = ["cp-icon"], Style = new() { IconId = s.IconId } },
-                    new() { ClassList = ["cp-text"] },
-                ],
-            };
+        lines.Add("");
+        lines.Add(Strings.T("TooltipHint"));
 
-            _itemNodes[s.ItemId] = node;
-            Node.AppendChild(node);
-        }
+        SetTooltip(string.Join("\n", lines));
     }
-
-    private void UpdateNodes()
-    {
-        bool showCap = GetConfigValue<bool>("ShowCap");
-        var  alert   = AlertColor;
-
-        List<string> tooltip = [];
-
-        foreach (var s in _states) {
-            tooltip.Add(s.Cap > 0 ? $"{s.Name} : {s.Count:N0} / {s.Cap:N0}" : $"{s.Name} : {s.Count:N0}");
-
-            if (!_itemNodes.TryGetValue(s.ItemId, out var node)) continue;
-
-            var text = node.QuerySelector(".cp-text")!;
-            text.NodeValue   = showCap && s.Cap > 0 ? $"{s.Count:N0}/{s.Cap:N0}" : $"{s.Count:N0}";
-            text.Style.Color = IsAlert(s) ? alert : null;
-        }
-
-        if (tooltip.Count > 0) {
-            tooltip.Add("");
-            tooltip.Add(Strings.T("TooltipHint"));
-        }
-
-        Node.Tooltip = tooltip.Count > 0 ? string.Join("\n", tooltip) : null;
-    }
-
-    // -------------------------------------------------------------- Stylesheet
-
-    private static Stylesheet BarStylesheet { get; } = new([
-        new(".cp-bar", new() {
-            Flow            = Flow.Horizontal,
-            Anchor          = Anchor.MiddleLeft,
-            Size            = new(0, SafeHeight),
-            Gap             = 10,
-            Padding         = new(0, 8),
-            BackgroundColor = new("Widget.Background"),
-            StrokeColor     = new("Widget.Border"),
-            StrokeWidth     = 1,
-            StrokeInset     = 1,
-            BorderRadius    = 5,
-        }),
-        new(".cp-bar:ghost", new() {
-            BackgroundColor = new(0),
-            StrokeColor     = new(0),
-        }),
-        new(".cp-item", new() {
-            Flow   = Flow.Horizontal,
-            Anchor = Anchor.MiddleLeft,
-            Gap    = 4,
-            Size   = new(0, SafeHeight),
-        }),
-        new(".cp-icon", new() {
-            Anchor = Anchor.MiddleLeft,
-            Size   = new(20, 20),
-        }),
-        new(".cp-text", TextStyle()),
-        new(".cp-empty", TextStyle()),
-    ]);
-
-    private static Style TextStyle() => new() {
-        Anchor       = Anchor.MiddleLeft,
-        TextAlign    = Anchor.MiddleLeft,
-        Size         = new(0, SafeHeight),
-        FontSize     = 13,
-        Color        = new("Widget.Text"),
-        OutlineColor = new("Widget.TextOutline"),
-        OutlineSize  = 1,
-        WordWrap     = false,
-        TextOverflow = false,
-    };
 }

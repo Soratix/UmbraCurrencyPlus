@@ -17,6 +17,9 @@ public sealed record ShopEntry(
 {
     /// <summary>Coût en monnaie d'un exemplaire.</summary>
     public double CostPerUnit => Quantity > 0 ? (double)Cost / Quantity : Cost;
+
+    /// <summary>Boutiques qui vendent l'objet à ce prix : RowId de SpecialShop, ou NpcTable.GrandCompanyShopKey.</summary>
+    public IReadOnlyList<uint> ShopKeys { get; init; } = [];
 }
 
 /// <summary>
@@ -83,9 +86,10 @@ public static class ShopTable
         }
 
         // (monnaie, objet) → entrée la moins chère par exemplaire.
-        Dictionary<(uint, uint), ShopEntry> best = [];
+        Dictionary<(uint, uint), ShopEntry>     best  = [];
+        Dictionary<(uint, uint), HashSet<uint>> shops = [];
 
-        void Add(uint currencyId, uint itemId, uint cost, uint quantity)
+        void Add(uint currencyId, uint itemId, uint cost, uint quantity, uint shopKey)
         {
             if (currencyId == 0 || itemId == 0 || cost == 0 || currencyId == itemId) return;
 
@@ -108,7 +112,10 @@ public static class ShopTable
 
             var key = (currencyId, itemId);
             if (!best.TryGetValue(key, out var existing) || entry.CostPerUnit < existing.CostPerUnit) {
-                best[key] = entry;
+                best[key]  = entry;
+                shops[key] = [shopKey];
+            } else if (Math.Abs(entry.CostPerUnit - existing.CostPerUnit) < 0.0001) {
+                shops[key].Add(shopKey);
             }
         }
 
@@ -128,7 +135,7 @@ public static class ShopTable
                     if (entry.ItemCosts.Count(c => c.ItemCost.RowId != 0) > 1) continue;
 
                     uint currency = ConvertCurrencyId(shop.RowId, cost.ItemCost.RowId, shop.UseCurrencyType, tomestones);
-                    Add(currency, receive.Item.RowId, cost.CurrencyCost, receive.ReceiveCount);
+                    Add(currency, receive.Item.RowId, cost.CurrencyCost, receive.ReceiveCount, shop.RowId);
                 }
             }
         }
@@ -141,11 +148,12 @@ public static class ShopTable
 
                 uint gc       = category.Value.GrandCompany.RowId;
                 uint currency = gc is >= 1 and <= 3 ? gc + 19 : 0; // sceaux : 20, 21, 22
-                Add(currency, sub.Item.RowId, sub.CostGCSeals, 1);
+                Add(currency, sub.Item.RowId, sub.CostGCSeals, 1, NpcTable.GrandCompanyShopKey(gc));
             }
         }
 
-        return best.Values
+        return best
+            .Select(kv => kv.Value with { ShopKeys = shops[kv.Key].ToList() })
             .GroupBy(e => e.CurrencyId)
             .ToDictionary(g => g.Key, g => g.OrderBy(e => e.Name, StringComparer.CurrentCultureIgnoreCase).ToList());
     }

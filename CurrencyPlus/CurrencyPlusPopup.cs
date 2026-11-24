@@ -1,14 +1,14 @@
 using System.Globalization;
-using Dalamud.Bindings.ImGui;
-using Dalamud.Game.Text.SeStringHandling;
 using Lumina.Excel.Sheets;
 
 namespace Umbra.CurrencyPlus;
 
 /// <summary>
-/// Popup du widget : une rangée de monnaies, puis deux onglets.
+/// Popup du widget : la rangée des monnaies suivies (et le bouton « Gérer » qui ouvre le sélecteur
+/// avec toutes les monnaies du jeu), puis deux onglets, chacun affiché seulement s'il a du contenu.
 ///  - Rentable : objets revendables, prix Universalis (médiane 7 j), triés par score = gils/point × ventes/7 j.
-///  - Collection : objets à débloquer que le personnage n'a pas encore (IUnlockState, aucun appel réseau).
+///  - Collection : objets à débloquer que le personnage n'a pas encore et ne possède pas (aucun appel réseau).
+/// Clic sur un objet : drapeau sur le vendeur et téléportation à l'éthérite la plus proche.
 /// </summary>
 public sealed class CurrencyPlusPopup : WidgetPopup
 {
@@ -29,8 +29,10 @@ public sealed class CurrencyPlusPopup : WidgetPopup
     protected override Node Node { get; }
 
     private Node CurrencyBar => Node.QuerySelector(".cp-currencies")!;
+    private Node Tabs        => Node.QuerySelector(".cp-tabs")!;
     private Node TabProfit   => Node.QuerySelector(".cp-tab.profit")!;
     private Node TabCollect  => Node.QuerySelector(".cp-tab.collection")!;
+    private Node RefreshBtn  => Node.QuerySelector(".cp-refresh")!;
     private Node Header      => Node.QuerySelector(".cp-header")!;
     private Node List        => Node.QuerySelector(".cp-list")!;
     private Node Status      => Node.QuerySelector(".cp-status")!;
@@ -41,10 +43,15 @@ public sealed class CurrencyPlusPopup : WidgetPopup
     private Column _sortColumn = Column.Score;
     private bool   _sortDesc   = true;
     private bool   _forceRefresh;
+    private bool   _managing;
 
     private string   _currencySignature = string.Empty;
     private string   _listSignature     = string.Empty;
     private DateTime _nextRequest       = DateTime.MinValue;
+
+    // Objets de collection manquants, recalculés au plus toutes les 5 s.
+    private string               _collectionKey = string.Empty;
+    private List<ShopEntry>      _missing       = [];
 
     public CurrencyPlusPopup(CurrencyPlusWidget widget)
     {
@@ -72,19 +79,26 @@ public sealed class CurrencyPlusPopup : WidgetPopup
 
         TabProfit.OnClick  += _ => SetTab(Tab.Profit);
         TabCollect.OnClick += _ => SetTab(Tab.Collection);
-        Node.QuerySelector(".cp-refresh")!.OnClick += _ => {
+        RefreshBtn.OnClick += _ => {
             _forceRefresh  = true;
-            _listSignature = string.Empty;
-            _nextRequest   = DateTime.MinValue;
+            _collectionKey = string.Empty;
+            Invalidate();
         };
     }
 
-    /// <summary>Choisit la monnaie affichée (clic sur une monnaie dans la barre).</summary>
+    /// <summary>Choisit la monnaie affichée.</summary>
     public void Select(uint currencyId)
     {
-        _selected      = currencyId;
-        _listSignature = string.Empty;
-        _nextRequest   = DateTime.MinValue;
+        _selected = currencyId;
+        _managing = false;
+        Invalidate();
+    }
+
+    private void Invalidate()
+    {
+        _listSignature     = string.Empty;
+        _currencySignature = string.Empty;
+        _nextRequest       = DateTime.MinValue;
     }
 
     private void SetTab(Tab tab)
@@ -94,9 +108,7 @@ public sealed class CurrencyPlusPopup : WidgetPopup
         _tab        = tab;
         _sortColumn = tab == Tab.Profit ? Column.Score : Column.Name;
         _sortDesc   = tab == Tab.Profit;
-
-        _listSignature = string.Empty;
-        _nextRequest   = DateTime.MinValue;
+        Invalidate();
     }
 
     private void SetSort(Column column)
@@ -117,13 +129,13 @@ public sealed class CurrencyPlusPopup : WidgetPopup
     {
         ShopData.EnsureStarted();
 
-        _currencySignature = string.Empty;
-        _listSignature     = string.Empty;
-        _nextRequest       = DateTime.MinValue;
+        _managing      = false;
+        _collectionKey = string.Empty;
+        Invalidate();
 
         TabProfit.NodeValue  = Strings.T("Tab.Profit");
         TabCollect.NodeValue = Strings.T("Tab.Collection");
-        Node.QuerySelector(".cp-refresh")!.NodeValue = Strings.T("Refresh");
+        RefreshBtn.NodeValue = Strings.T("Refresh");
     }
 
     protected override void OnUpdate()
@@ -136,25 +148,50 @@ public sealed class CurrencyPlusPopup : WidgetPopup
 
         UpdateCurrencyBar(states);
 
-        TabProfit.ToggleClass("active", _tab == Tab.Profit);
-        TabCollect.ToggleClass("active", _tab == Tab.Collection);
+        if (_managing) {
+            UpdateManager();
+            return;
+        }
 
         var state = states.FirstOrDefault(s => s.ItemId == _selected);
         if (state == null) {
-            ShowMessage(Strings.T("NoCurrency"));
+            Tabs.Style.IsVisible = false;
+            ShowMessage(Strings.T("NoCurrencyHint"));
             return;
         }
 
         var entries = ShopData.For(_selected);
         if (entries == null) {
+            Tabs.Style.IsVisible = false;
             ShowMessage(ShopData.Error is { } err ? Strings.T("Error.Shops", err) : Strings.T("Loading.Shops"));
             return;
         }
 
+        // Onglets affichés seulement s'il y a quelque chose dedans.
+        var  marketable    = entries.Where(e => e.IsMarketable).ToList();
+        var  missing       = MissingCollectibles(entries);
+        bool hasProfit     = marketable.Count > 0;
+        bool hasCollection = missing is { Count: > 0 };
+
+        TabProfit.Style.IsVisible  = hasProfit;
+        TabCollect.Style.IsVisible = hasCollection;
+        Tabs.Style.IsVisible       = hasProfit || hasCollection;
+
+        if (_tab == Tab.Profit && !hasProfit && hasCollection) SetTab(Tab.Collection);
+        if (_tab == Tab.Collection && !hasCollection && hasProfit) SetTab(Tab.Profit);
+
+        TabProfit.ToggleClass("active", _tab == Tab.Profit);
+        TabCollect.ToggleClass("active", _tab == Tab.Collection);
+
+        if (!hasProfit && !hasCollection) {
+            ShowMessage(Strings.T(entries.Count == 0 ? "Empty.Shop" : missing == null ? "Error.Unlocks" : "Empty.All"));
+            return;
+        }
+
         if (_tab == Tab.Profit) {
-            UpdateProfit(state, entries);
+            UpdateProfit(state, marketable);
         } else {
-            UpdateCollection(state, entries);
+            UpdateCollection(state, missing!);
         }
     }
 
@@ -162,7 +199,7 @@ public sealed class CurrencyPlusPopup : WidgetPopup
 
     private void UpdateCurrencyBar(IReadOnlyList<CurrencyState> states)
     {
-        string signature = string.Join(",", states.Select(s => $"{s.ItemId}:{s.Count}")) + $"|{_selected}";
+        string signature = string.Join(",", states.Select(s => $"{s.ItemId}:{s.Count}")) + $"|{_selected}|{_managing}";
         if (signature == _currencySignature) return;
         _currencySignature = signature;
 
@@ -183,10 +220,77 @@ public sealed class CurrencyPlusPopup : WidgetPopup
                 ],
             };
 
-            chip.ToggleClass("selected", id == _selected);
+            chip.ToggleClass("selected", !_managing && id == _selected);
             chip.OnClick += _ => Select(id);
             CurrencyBar.AppendChild(chip);
         }
+
+        var manage = new Node {
+            ClassList = ["cp-chip", "manage"],
+            NodeValue = _managing ? Strings.T("Manage.Done") : Strings.T("Manage"),
+            Tooltip   = Strings.T("Manage.Tooltip"),
+        };
+        manage.ToggleClass("selected", _managing);
+        manage.OnClick += _ => {
+            _managing = !_managing;
+            Invalidate();
+        };
+        CurrencyBar.AppendChild(manage);
+    }
+
+    // -------------------------------------------------- Sélecteur de monnaies
+
+    private void UpdateManager()
+    {
+        var tracked = _widget.TrackedIds();
+
+        string signature = $"M|{string.Join(",", tracked)}";
+        if (signature == _listSignature) return;
+        _listSignature = signature;
+
+        Tabs.Style.IsVisible   = false;
+        Header.Style.IsVisible = false;
+        Status.Style.IsVisible = false;
+        List.Style.IsVisible   = true;
+        Header.Clear();
+        List.Clear();
+
+        List<CatalogEntry> catalog;
+        try {
+            catalog = Currencies.Catalog();
+        } catch (Exception e) {
+            Logger.Error($"[CurrencyPlus] Liste des monnaies illisible : {e.Message}");
+            ShowMessage(Strings.T("Error.Catalog"));
+            return;
+        }
+
+        foreach (var group in catalog.GroupBy(c => c.Group)) {
+            List.AppendChild(new() { ClassList = ["cp-group"], NodeValue = Strings.T($"Group.{group.Key}") });
+
+            var grid = new Node { ClassList = ["cp-grid"] };
+            foreach (var c in group) {
+                uint id   = c.ItemId;
+                var  tile = new Node {
+                    ClassList  = ["cp-tile"],
+                    Tooltip    = c.Name,
+                    ChildNodes = [
+                        new() { ClassList = ["cp-tile-icon"], Style = new() { IconId = c.IconId } },
+                        new() { ClassList = ["cp-tile-text"], NodeValue = c.Name },
+                    ],
+                };
+
+                tile.ToggleClass("selected", tracked.Contains(id));
+                tile.OnClick += _ => {
+                    _widget.ToggleTracked(id);
+                    _listSignature = string.Empty;
+                };
+                grid.AppendChild(tile);
+            }
+
+            List.AppendChild(grid);
+        }
+
+        Footer.NodeValue = Strings.T("Manage.Footer");
     }
 
     // ------------------------------------------------------------ Rentable
@@ -209,14 +313,8 @@ public sealed class CurrencyPlusPopup : WidgetPopup
         return world;
     }
 
-    private void UpdateProfit(CurrencyState state, IReadOnlyList<ShopEntry> entries)
+    private void UpdateProfit(CurrencyState state, List<ShopEntry> marketable)
     {
-        var marketable = entries.Where(e => e.IsMarketable).ToList();
-        if (marketable.Count == 0) {
-            ShowMessage(Strings.T(entries.Count == 0 ? "Empty.Shop" : "Empty.Profit"));
-            return;
-        }
-
         string market = MarketName();
         if (string.IsNullOrEmpty(market)) {
             ShowMessage(Strings.T("Error.NoMarket"));
@@ -233,7 +331,18 @@ public sealed class CurrencyPlusPopup : WidgetPopup
 
         var snapshot = PriceService.Get(_selected, market);
 
-        string signature = $"P|{_selected}|{market}|{snapshot.Version}|{_sortColumn}|{_sortDesc}|{(int)(DateTime.UtcNow - snapshot.FetchedAt).TotalMinutes}";
+        List<Column> columns = [Column.Name];
+        foreach (string c in CurrencyPlusWidget.ProfitColumns) {
+            if (_widget.IsColumnVisible(c)) columns.Add(Enum.Parse<Column>(c));
+        }
+
+        // Tri sur une colonne masquée : on revient au nom.
+        if (!columns.Contains(_sortColumn) && _sortColumn != Column.Score) {
+            _sortColumn = Column.Name;
+            _sortDesc   = false;
+        }
+
+        string signature = $"P|{_selected}|{market}|{snapshot.Version}|{_sortColumn}|{_sortDesc}|{string.Join(",", columns)}|{(int)(DateTime.UtcNow - snapshot.FetchedAt).TotalMinutes}";
         if (signature == _listSignature) return;
         _listSignature = signature;
 
@@ -255,14 +364,14 @@ public sealed class CurrencyPlusPopup : WidgetPopup
             return new Row(e, price, sales, gpp, gpp * sales, state.Count >= e.Cost);
         }).ToList();
 
-        Column[] columns = [Column.Name, Column.Cost, Column.Price, Column.Sales, Column.GilPerPoint, Column.Score];
-        RenderTable(columns, Sort(rows), row => [
-            Fmt(row.Entry.Cost),
-            row.Price > 0 ? Fmt(row.Price) : "—",
-            row.Sales > 0 ? row.Sales.ToString("0.#", CultureInfo.CurrentCulture) : "0",
-            row.GilPerPoint > 0 ? row.GilPerPoint.ToString(row.GilPerPoint >= 100 ? "N0" : "N1", CultureInfo.CurrentCulture) : "—",
-            row.Score > 0 ? Fmt(row.Score) : "—",
-        ]);
+        RenderTable(columns, Sort(rows), (row, col) => col switch {
+            Column.Cost        => Fmt(row.Entry.Cost),
+            Column.Price       => row.Price > 0 ? Fmt(row.Price) : "—",
+            Column.Sales       => row.Sales > 0 ? row.Sales.ToString("0.#", CultureInfo.CurrentCulture) : "0",
+            Column.GilPerPoint => row.GilPerPoint > 0 ? row.GilPerPoint.ToString(row.GilPerPoint >= 100 ? "N0" : "N1", CultureInfo.CurrentCulture) : "—",
+            Column.Score       => row.Score > 0 ? Fmt(row.Score) : "—",
+            _                  => string.Empty,
+        });
 
         int minutes = (int)Math.Max(0, (DateTime.UtcNow - snapshot.FetchedAt).TotalMinutes);
         SetFooter(snapshot.Status == PriceStatus.Loading ? Strings.T("Loading.Prices") : Strings.T("Footer.Prices", market, minutes), rows.Count);
@@ -270,47 +379,44 @@ public sealed class CurrencyPlusPopup : WidgetPopup
 
     // ---------------------------------------------------------- Collection
 
-    private void UpdateCollection(CurrencyState state, IReadOnlyList<ShopEntry> entries)
+    /// <summary>Objets débloquables pas encore débloqués ni possédés. Null si l'état des déblocages est indisponible.</summary>
+    private List<ShopEntry>? MissingCollectibles(IReadOnlyList<ShopEntry> entries)
     {
-        // Rafraîchi toutes les 5 s (un objet a pu être débloqué entre-temps) ou si la quantité change.
-        long bucket = DateTime.UtcNow.Ticks / TimeSpan.FromSeconds(5).Ticks;
-        string signature = $"C|{_selected}|{state.Count}|{_sortColumn}|{_sortDesc}|{bucket}";
-        if (signature == _listSignature) return;
-        _listSignature = signature;
-        _forceRefresh  = false;
-
-        if (entries.Count == 0) {
-            ShowMessage(Strings.T("Empty.Shop"));
-            return;
-        }
+        long   bucket = DateTime.UtcNow.Ticks / TimeSpan.FromSeconds(5).Ticks;
+        string key    = $"{_selected}|{bucket}";
+        if (key == _collectionKey) return _missing;
 
         var unlocks = Unlocks.State;
-        if (unlocks == null) {
-            ShowMessage(Strings.T("Error.Unlocks"));
-            return;
-        }
+        if (unlocks == null) return null;
 
         var items = Framework.Service<IDataManager>().GetExcelSheet<Item>();
 
-        List<Row> rows = [];
+        List<ShopEntry> missing = [];
         foreach (var e in entries) {
             var item = items.GetRowOrDefault(e.ItemId);
-            if (item == null || !Unlocks.IsMissingCollectible(unlocks, item.Value)) continue;
-
-            rows.Add(new(e, 0, 0, 0, 0, state.Count >= e.Cost));
+            if (item != null && Unlocks.IsMissingCollectible(unlocks, item.Value)) missing.Add(e);
         }
 
-        if (rows.Count == 0) {
-            ShowMessage(Strings.T("Empty.Collection"));
-            return;
-        }
+        _collectionKey = key;
+        _missing       = missing;
+        return missing;
+    }
+
+    private void UpdateCollection(CurrencyState state, List<ShopEntry> missing)
+    {
+        string signature = $"C|{_selected}|{state.Count}|{_sortColumn}|{_sortDesc}|{_collectionKey}";
+        if (signature == _listSignature) return;
+        _listSignature = signature;
+
+        List<Row> rows = missing.Select(e => new Row(e, 0, 0, 0, 0, state.Count >= e.Cost)).ToList();
 
         Column[] columns = [Column.Name, Column.Type, Column.Cost, Column.Enough];
-        RenderTable(columns, Sort(rows), row => [
-            row.Entry.Category,
-            Fmt(row.Entry.Cost),
-            row.Enough ? Strings.T("Yes") : Strings.T("No"),
-        ]);
+        RenderTable(columns, Sort(rows), (row, col) => col switch {
+            Column.Type   => row.Entry.Category,
+            Column.Cost   => Fmt(row.Entry.Cost),
+            Column.Enough => row.Enough ? Strings.T("Yes") : Strings.T("No"),
+            _             => string.Empty,
+        });
 
         SetFooter(null, rows.Count);
     }
@@ -338,7 +444,7 @@ public sealed class CurrencyPlusPopup : WidgetPopup
         return ordered.ThenBy(r => r.Entry.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
     }
 
-    private void RenderTable(Column[] columns, List<Row> rows, Func<Row, string[]> cells)
+    private void RenderTable(IReadOnlyList<Column> columns, List<Row> rows, Func<Row, Column, string> cell)
     {
         Status.Style.IsVisible = false;
         Header.Style.IsVisible = true;
@@ -351,33 +457,37 @@ public sealed class CurrencyPlusPopup : WidgetPopup
             string label = ColumnLabel(col);
             if (col == _sortColumn) label += _sortDesc ? " ▼" : " ▲";
 
-            var cell = new Node { ClassList = ["cp-cell", "head", ColumnClass(col)], NodeValue = label };
-            cell.OnClick += _ => SetSort(col);
-            Header.AppendChild(cell);
+            var head = new Node { ClassList = ["cp-cell", "head", ColumnClass(col)], NodeValue = label };
+            head.OnClick += _ => SetSort(col);
+            Header.AppendChild(head);
         }
 
         List.Clear();
 
-        int max = _widget.GetConfigValue<int>("MaxRows");
+        bool teleport = _widget.GetConfigValue<bool>("Teleport");
+        int  max      = _widget.GetConfigValue<int>("MaxRows");
+
         foreach (var row in rows.Take(max)) {
             var entry = row.Entry;
             var node  = new Node {
                 ClassList  = ["cp-row"],
+                Tooltip    = teleport ? Strings.T("Row.Tooltip.Teleport") : Strings.T("Row.Tooltip.Flag"),
                 ChildNodes = [
                     new() { ClassList = ["cp-cell", "icon"], Style = new() { IconId = entry.IconId } },
-                    new() { ClassList = ["cp-cell", ColumnClass(Column.Name)], NodeValue = entry.Quantity > 1 ? $"{entry.Name} ×{entry.Quantity}" : entry.Name },
                 ],
             };
 
-            string[] values = cells(row);
-            for (int i = 0; i < values.Length && i + 1 < columns.Length; i++) {
-                var col  = columns[i + 1];
-                var cell = new Node { ClassList = ["cp-cell", ColumnClass(col)], NodeValue = values[i] };
-                if (col == Column.Enough) cell.Style.Color = row.Enough ? YesColor : NoColor;
-                node.AppendChild(cell);
+            foreach (var col in columns) {
+                string text = col == Column.Name
+                    ? (entry.Quantity > 1 ? $"{entry.Name} ×{entry.Quantity}" : entry.Name)
+                    : cell(row, col);
+
+                var c = new Node { ClassList = ["cp-cell", ColumnClass(col)], NodeValue = text };
+                if (col == Column.Enough) c.Style.Color = row.Enough ? YesColor : NoColor;
+                node.AppendChild(c);
             }
 
-            node.OnClick += _ => OnItemClicked(entry);
+            node.OnClick += _ => OnItemClicked(entry, teleport);
             List.AppendChild(node);
         }
     }
@@ -401,29 +511,18 @@ public sealed class CurrencyPlusPopup : WidgetPopup
         List<string> parts = [];
         if (!string.IsNullOrEmpty(info)) parts.Add(info);
         if (total > max) parts.Add(Strings.T("Footer.Truncated", max, total));
-        parts.Add(Strings.T("Footer.Click"));
+        parts.Add(_widget.GetConfigValue<bool>("Teleport") ? Strings.T("Footer.Click.Teleport") : Strings.T("Footer.Click.Flag"));
 
         Footer.NodeValue = string.Join(" · ", parts);
     }
 
-    /// <summary>
-    /// Clic sur un objet : son lien s'affiche dans le chat (localement, cliquable, avec la fiche de l'objet)
-    /// et son nom est copié dans le presse-papiers, prêt à coller dans la recherche du tableau des ventes.
-    /// Envoyer le lien dans un canal public demanderait d'injecter du texte dans la saisie du chat.
-    /// </summary>
-    private static void OnItemClicked(ShopEntry entry)
+    private void OnItemClicked(ShopEntry entry, bool teleport)
     {
         try {
-            ImGui.SetClipboardText(entry.Name);
-
-            var message = new SeStringBuilder()
-                .Append(SeString.CreateItemLink(entry.ItemId, false))
-                .AddText($" — {Strings.T("Chat.Copied", entry.Name)}")
-                .Build();
-
-            Framework.Service<IChatGui>().Print(message, "Currencies+");
+            Travel.GoTo(entry, teleport);
+            if (teleport) Close();
         } catch (Exception e) {
-            Logger.Error($"[CurrencyPlus] Clic sur l'objet {entry.ItemId} : {e.Message}");
+            Logger.Error($"[CurrencyPlus] Clic sur l'objet {entry.ItemId} : {e}");
         }
     }
 
@@ -435,17 +534,17 @@ public sealed class CurrencyPlusPopup : WidgetPopup
         Column.Price       => Strings.T("Col.Price"),
         Column.Sales       => Strings.T("Col.Sales"),
         Column.GilPerPoint => Strings.T("Col.GilPerPoint"),
-        Column.Score       => "Score",
+        Column.Score       => Strings.T("Col.Score"),
         Column.Type        => Strings.T("Col.Type"),
         Column.Enough      => Strings.T("Col.Enough"),
         _                  => string.Empty,
     };
 
     private static string ColumnClass(Column col) => col switch {
-        Column.Name        => "name",
-        Column.Type        => "type",
-        Column.Enough      => "enough",
-        _                  => "num",
+        Column.Name   => "name",
+        Column.Type   => "type",
+        Column.Enough => "enough",
+        _             => "num",
     };
 
     // ------------------------------------------------------------ Stylesheet
@@ -462,10 +561,19 @@ public sealed class CurrencyPlusPopup : WidgetPopup
         TextOverflow = false,
     };
 
+    private static Style Muted(int fontSize, int width) => new() {
+        Size         = new(width, 0),
+        FontSize     = fontSize,
+        WordWrap     = true,
+        Color        = new("Widget.PopupMenuTextMuted"),
+        OutlineColor = new("Widget.PopupMenuTextOutline"),
+        OutlineSize  = 1,
+    };
+
     private static Stylesheet PopupStylesheet { get; } = new([
         new("#cp-popup", new() { Flow = Flow.Vertical, Padding = new(8), Gap = 6 }),
 
-        new(".cp-currencies", new() { Flow = Flow.Horizontal, Gap = 4 }),
+        new(".cp-currencies", new() { Flow = Flow.Horizontal, Gap = 4, Size = new(ListWidth, 0) }),
         new(".cp-chip", new() {
             Flow         = Flow.Horizontal,
             Gap          = 4,
@@ -476,6 +584,15 @@ public sealed class CurrencyPlusPopup : WidgetPopup
         }),
         new(".cp-chip:hover", new() { BackgroundColor = new("Widget.PopupMenuBackgroundHover") }),
         new(".cp-chip.selected", new() { BackgroundColor = new("Widget.PopupMenuBackgroundHover"), StrokeColor = new("Widget.PopupMenuText") }),
+        new(".cp-chip.manage", new() {
+            FontSize     = 12,
+            TextAlign    = Anchor.MiddleCenter,
+            Size         = new(0, 26),
+            Padding      = new(0, 10),
+            Color        = new("Widget.PopupMenuText"),
+            OutlineColor = new("Widget.PopupMenuTextOutline"),
+            OutlineSize  = 1,
+        }),
         new(".cp-chip-icon", new() { Size = new(20, 20), Anchor = Anchor.MiddleLeft }),
         new(".cp-chip-text", CellText(0, Anchor.MiddleLeft)),
 
@@ -518,10 +635,10 @@ public sealed class CurrencyPlusPopup : WidgetPopup
             BorderWidth = new() { Bottom = 1 },
         }),
         new(".cp-list", new() {
-            Flow                 = Flow.Vertical,
-            Size                 = new(ListWidth, ListHeight),
-            ScrollbarTrackColor  = new(0x30000000),
-            ScrollbarThumbColor  = new("Widget.Border"),
+            Flow                = Flow.Vertical,
+            Size                = new(ListWidth, ListHeight),
+            ScrollbarTrackColor = new(0x30000000),
+            ScrollbarThumbColor = new("Widget.Border"),
         }),
         new(".cp-row", new() { Flow = Flow.Horizontal, Gap = 6, Padding = new(1, 0), BorderRadius = 3 }),
         new(".cp-row:hover", new() { BackgroundColor = new("Widget.PopupMenuBackgroundHover") }),
@@ -534,6 +651,30 @@ public sealed class CurrencyPlusPopup : WidgetPopup
         new(".cp-cell.head", new() { Color = new("Widget.PopupMenuTextMuted") }),
         new(".cp-cell.head:hover", new() { Color = new("Widget.PopupMenuTextHover") }),
 
+        // Sélecteur de monnaies : une grille de tuiles par groupe, comme la fenêtre « Devises ».
+        new(".cp-group", new() {
+            Size         = new(ListWidth - 16, 0),
+            Padding      = new() { Top = 6, Bottom = 2 },
+            FontSize     = 12,
+            Color        = new("Widget.PopupMenuTextMuted"),
+            OutlineColor = new("Widget.PopupMenuTextOutline"),
+            OutlineSize  = 1,
+            BorderColor  = new() { Bottom = new("Widget.Border") },
+            BorderWidth  = new() { Bottom = 1 },
+        }),
+        new(".cp-grid", new() { Flow = Flow.Vertical, Gap = 2 }),
+        new(".cp-tile", new() {
+            Flow         = Flow.Horizontal,
+            Gap          = 6,
+            Padding      = new(2, 6),
+            BorderRadius = 4,
+            Size         = new(ListWidth - 16, 0),
+        }),
+        new(".cp-tile:hover", new() { BackgroundColor = new("Widget.PopupMenuBackgroundHover") }),
+        new(".cp-tile.selected", new() { BackgroundColor = new(0x4066DD66), StrokeColor = new(0xFF66DD66), StrokeWidth = 1 }),
+        new(".cp-tile-icon", new() { Size = new(24, 24), Anchor = Anchor.MiddleLeft }),
+        new(".cp-tile-text", CellText(0, Anchor.MiddleLeft)),
+
         new(".cp-status", new() {
             Size         = new(ListWidth, 60),
             FontSize     = 13,
@@ -543,13 +684,6 @@ public sealed class CurrencyPlusPopup : WidgetPopup
             OutlineColor = new("Widget.PopupMenuTextOutline"),
             OutlineSize  = 1,
         }),
-        new(".cp-footer", new() {
-            Size         = new(ListWidth, 0),
-            FontSize     = 11,
-            WordWrap     = true,
-            Color        = new("Widget.PopupMenuTextMuted"),
-            OutlineColor = new("Widget.PopupMenuTextOutline"),
-            OutlineSize  = 1,
-        }),
+        new(".cp-footer", Muted(11, ListWidth)),
     ]);
 }
