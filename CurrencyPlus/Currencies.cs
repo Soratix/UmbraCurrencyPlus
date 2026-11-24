@@ -54,9 +54,10 @@ public static class Currencies
     /// <summary>
     /// Toutes les monnaies de la fenêtre « Devises » du jeu : celles que CurrencyManager connaît
     /// (ses trois listes), plus les sceaux de toutes les Grandes Compagnies, les monnaies des
-    /// tribus alliées (BeastTribe.CurrencyItem) et les PGS. À appeler sur le thread du jeu.
+    /// tribus alliées (BeastTribe.CurrencyItem), les mémoquartz de la saison, les PGS, et les
+    /// monnaies déjà suivies (pour pouvoir toujours les retirer). À appeler sur le thread du jeu.
     /// </summary>
-    public static unsafe List<CatalogEntry> Catalog()
+    public static unsafe List<CatalogEntry> Catalog(IEnumerable<uint> tracked)
     {
         var data  = Framework.Service<IDataManager>();
         var items = data.GetExcelSheet<Item>();
@@ -76,17 +77,25 @@ public static class Currencies
             foreach (var special in cm->SpecialItemBucket.Values) ids.Add(cm->GetItemIdBySpecialId(special.SpecialId));
         }
 
-        // Les mémoquartz sans boutique (anciens) n'ont plus d'intérêt : on garde poétique, non limité et limité.
+        // Mémoquartz de la saison : poétique (1), non limité (2), limité (3). Ils ne figurent pas
+        // toujours dans les listes de CurrencyManager, on les ajoute donc explicitement.
+        // Les anciens mémoquartz n'ont plus de boutique : ils sont écartés.
         HashSet<uint> currentTomes = data.GetExcelSheet<TomestonesItem>()
             .Where(r => r.Tomestones.RowId is 1 or 2 or 3)
             .Select(r => r.Item.RowId)
             .ToHashSet();
+        ids.UnionWith(currentTomes);
+
+        HashSet<uint> trackedIds = tracked.ToHashSet();
+        ids.UnionWith(trackedIds);
 
         List<CatalogEntry> result = [];
         foreach (uint id in ids) {
             if (id <= 1) continue; // gils : aucune boutique couverte
-            if (IsGrandCompanySeal(id) && id != seal) continue;
-            if (tomestones.Contains(id) && !currentTomes.Contains(id)) continue;
+            if (!trackedIds.Contains(id)) {
+                if (IsGrandCompanySeal(id) && id != seal) continue;
+                if (tomestones.Contains(id) && !currentTomes.Contains(id)) continue;
+            }
 
             var item = items.GetRowOrDefault(id);
             if (item == null) continue;

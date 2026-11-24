@@ -257,7 +257,7 @@ public sealed class CurrencyPlusPopup : WidgetPopup
 
         List<CatalogEntry> catalog;
         try {
-            catalog = Currencies.Catalog();
+            catalog = Currencies.Catalog(tracked);
         } catch (Exception e) {
             Logger.Error($"[CurrencyPlus] Liste des monnaies illisible : {e.Message}");
             ShowMessage(Strings.T("Error.Catalog"));
